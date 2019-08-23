@@ -1,0 +1,310 @@
+#!/bin/bash
+set -ex
+
+source activate qiime2-2017.4
+
+# use high performance local disk to each node
+export TMPDIR=/localscratch
+tmp=$(mktemp -d --tmpdir)
+export TMPDIR=$tmp
+
+# from http://stackoverflow.com/a/2130323
+function cleanup {
+  echo "Removing $tmp"
+  rm  -r $tmp
+  unset TMPDIR
+}
+trap cleanup EXIT
+
+cwd=$(pwd)
+pushd $tmp
+
+# fetch staged raw sequence
+curl -o raw-sequences.fna.gz ftp://ftp.microbio.me/pub/publications-files/american-gut/raw-sequences.fna.gz
+
+# fetch the taxonomy classifier reference database
+curl -L -o gg-13-8-99-515-806-nb-classifier.qza https://data.qiime2.org/2017.4/common/gg-13-8-99-515-806-nb-classifier.qza
+
+# fetch a script to expand sOTUs to closed reference OTUs
+curl -L -o expand.py https://raw.githubusercontent.com/wasade/reimagined-fiesta/master/expand.py
+
+# fetch and install SEPP for performing fragment insertion
+curl -L -o sepp-package.tar.bz https://raw.github.com/smirarab/sepp-refs/master/gg/sepp-package.tar.bz
+tar xfj sepp-package.tar.bz
+pushd sepp-package/sepp
+python setup.py config -c
+popd
+
+# unzip and process with deblur
+zcat $HOME/raw-sequences.fna.gz > raw-sequences.fna
+deblur workflow --seqs-fp raw-sequences.fna --output-dir ag-deblurred-100nt --jobs-to-start 32 --trim-length 100 --min-reads 0 
+cp -r ag-deblurred-100nt $cwd/
+
+# grab folivorous primate data direct from qiita
+cp /projects/qiita_test_data/Demultiplexed/35446/seqs.fasta qiita_11212.fasta
+deblur workflow --seqs-fp qiita_11212.fasta --output-dir qiita-11212-deblurred-100nt --jobs-to-start 32 --trim-length 100 --min-reads 0 
+cp -r qiita-11212-deblurred-100nt $cwd/
+
+# grab yanomami data direct from qiita
+cp /projects/qiita_test_data/preprocessed_data/228_seqs.fna qiita_10052.fasta
+deblur workflow --seqs-fp qiita_10052.fasta --output-dir qiita-10052-deblurred-100nt --jobs-to-start 32 --trim-length 100 --min-reads 0 
+cp -r qiita-10052-deblurred-100nt $cwd/
+
+# grab peruvian data direct from qiita
+cp /projects/qiita_test_data/Demultiplexed/3042/seqs.fna qiita_1448.fasta
+deblur workflow --seqs-fp qiita_1448.fasta --output-dir qiita-1448-deblurred-100nt --jobs-to-start 32 --trim-length 100 --min-reads 0 
+cp -r qiita-1448-deblurred-100nt $cwd/
+
+# grab global gut data direct from qiita
+cp /projects/qiita_test_data/preprocessed_data/171_seqs.fna qiita_850.fasta
+deblur workflow --seqs-fp /projects/qiita_test_data/preprocessed_data/171_seqs.fna --output-dir qiita-850-deblurred-100nt --jobs-to-start 32 --trim-length 100 --min-reads 0 
+cp -r qiita-850-deblurred-100nt $cwd/
+
+# grab smits et al hadza
+cp /projects/qiita_test_data/Demultiplexed/34910/seqs.fasta qiita_11358.fasta
+deblur workflow --seqs-fp qiita_11358.fasta --output-dir qiita-11358-deblurred-100nt --jobs-to-start 32 --trim-length 100 --min-reads 0 
+cp -r qiita-11358-deblurred-100nt $cwd/
+
+metatag=qs850_qs10052_qs1448_qs11212_qs10317_qs11358
+python ${cwd}/concat.py ${metatag}.biom ag-deblurred-100nt/reference-hit.biom qiita-11212-deblurred-100nt/reference-hit.biom qiita-850-deblurred-100nt/reference-hit.biom qiita-10052-deblurred-100nt/reference-hit.biom qiita-1448-deblurred-100nt/reference-hit.biom qiita-11358-deblurred-100nt/reference-hit.biom
+
+cp ${metatag}.biom $cwd/
+
+#### fetch the bloom sequences, and cut them to the various trim lengths
+curl -o blooms.fna https://raw.githubusercontent.com/knightlab-analyses/bloom-analyses/master/data/newbloom.all.fna
+cut -c 1-100 blooms.fna > bloom100.fa
+
+source activate qiime191
+#### remove any bloom seqquences
+filter_otus_from_otu_table.py -i ${metatag}.biom -e bloom100.fa -o ${metatag}_nobloom.biom
+filter_otus_from_otu_table.py -i ${metatag}.biom -n 3 -o ${metatag}_nobloom_nodoubletons.biom
+filter_samples_from_otu_table.py -i ${metatag}_nobloom_nodoubletons.biom -o ${metatag}_nobloom_nodoubletons_min1k.biom -n 1000
+single_rarefaction.py -i ${metatag}_nobloom_nodoubletons_min1k.biom -o ${metatag}_nobloom_nodoubletons_even1k.biom -d 1000
+
+cp ${metatag}_nobloom.biom $cwd/
+cp ${metatag}_nobloom_nodoubletons_even1k.biom $cwd/
+cp ${metatag}_nobloom_nodoubletons_min1k.biom $cwd/
+cp ${metatag}_nobloom_nodoubletons.biom $cwd/
+
+f_even=${metatag}_nobloom_nodoubletons_even1k.biom
+f_insert=${metatag}_nobloom_nodoubletons_min1k.biom
+fna=$(basename $f_insert .biom).fna
+base_even=$(basename $f_even .biom)
+base_insert=$(basename $f_insert .biom)
+
+# get a representative fasta file
+python -c "import biom; t = biom.load_table('$f_insert'); f = open('$fna', 'w'); f.write(''.join(['>%s\n%s\n' % (i, i.upper()) for i in t.ids(axis='observation')]))"
+cp $fna $cwd/
+    
+## insert the fragments into greengenes
+./sepp-package/run-sepp.sh $fna $base_insert -x 32
+cp ${base_insert}*.tog.tre ${base_insert}*.json $cwd/
+
+# compute DMs
+/home/mcdonadt/unifrac/sucpp/ssu -i $f_even -o ${base_even}.unweighted.dm -m unweighted -n 4 -t ${base_insert}_placement.tog.tre &
+/home/mcdonadt/unifrac/sucpp/ssu -i $f_even -o ${base_even}.weighted.dm -m weighted_normalized -n 4 -t ${base_insert}_placement.tog.tre &
+wait
+
+cp ${base_even}.unweighted.dm $cwd/
+cp ${base_even}.weighted.dm $cwd/
+
+# map the fragments against greengenes 99%
+pick_otus.py -i $fna -o ${base_insert}_gg_cr99 -m sortmerna -s 0.99 --threads 8
+    
+source activate qiime2-2017.4
+# perform taxonomy assignment
+qiime tools import --type FeatureData[Sequence] --input-path $fna --output-path ${fna}.qza
+qiime feature-classifier classify-sklearn --i-classifier gg-13-8-99-515-806-nb-classifier.qza --i-reads ${fna}.qza --o-classification ${base_insert}-taxonomy.qza
+uuid=$(qiime tools peek ${base_insert}-taxonomy.qza | grep UUID | awk '{ print $2 }')
+unzip ${base_insert}-taxonomy.qza
+biom add-metadata -i $f_insert --observation-metadata-fp ${uuid}/data/taxonomy.tsv -o ${f_insert}_tax.biom --observation-header "#OTUID",taxonomy --sc-separated taxonomy
+cp ${f_insert}_tax.biom $cwd/
+
+#Subsequent analyses were done using #QIIME v1.9.1 unless otherwise noted
+# filtering resulting .biom table to the gut microbiomes of ten adults per population
+# see supplemental mapping file
+
+filter_samples_from_OTU_table.py -i qs850_qs10052_qs1448_qs11212_qs10317_qs11358_nobloom_nodoubletons_min1k.biom_tax.biom --sample_id_fp  human_NHP_mapping.txt -o table_min1k_filtered.biom
+
+#remove mitochondria and chloroplasts
+
+filter_taxa_from_otu_table.py -i table_min1k_filtered.biom -o table_min1k_filtered_nochlor.biom -n c__Chloroplast
+
+filter_taxa_from_otu_table.py -i table_min1k_filtered_nochlor.biom -o table_min1k_filtered_nochlor_nomit.biom -n f__mitochondria
+
+#rarefy to 9870
+
+single_rarefaction.py -i table_min1k_filtered_nochlor_nomit.biom -o table_min1k_filtered_nochlor_nomit_even9870.biom -d 9870
+
+#make ordination plot for all
+
+beta_diversity_through_plots.py -i table_min1k_filtered_nochlor_nomit_even9870.biom -o beta_10perpop -t qs850_qs10052_qs1448_qs11212_qs10317_qs11358_nobloom_nodoubletons_min1k_placement.tog.tre -m human_NHP_mapping.txt 
+
+#filter to humans, cercopithecines, apes only (make sure filter3 eliminates colobines)
+
+filter_samples_from_otu_table.py -i table_min1k_filtered_nochlor_nomit_even9870.biom -o  table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans.biom -m human_NHP_mapping.txt -s 'HCA:keep'
+
+#ordination plot
+
+beta_diversity_through_plots.py -i table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans.biom -o beta_10perpop_OWMapeshumans -t qs850_qs10052_qs1448_qs11212_qs10317_qs11358_nobloom_nodoubletons_min1k_placement.tog.tre -m human_NHP_mapping.txt 
+
+#jackknife for UPGMA tree
+
+jackknifed_beta_diversity.py -i table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans.biom -o jackknife_OWMapehumans -e 9870 -m human_NHP_mapping.txt -t qs850_qs10052_qs1448_qs11212_qs10317_qs11358_nobloom_nodoubletons_min1k_placement.tog.tre -p /Users/Kramato/Desktop/param.txt
+
+#parameters are
+#multiple_rarefactions_even_depth:num_reps 1000
+
+#alpha diversity
+
+alpha_diversity.py -i table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans.biom -o alpha_div.txt -t qs850_qs10052_qs1448_qs11212_qs10317_qs11358_nobloom_nodoubletons_min1k_placement.tog.tre
+
+#filter to humans only
+
+filter_samples_from_otu_table.py -i table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans.biom -o table_min1k_filtered_nochlor_nomit_even9870_humans.biom -m human_NHP_mapping.txt -s 'phyl_group:human'
+
+#ordination plot and distance matrix
+
+beta_diversity_through_plots.py -i table_min1k_filtered_nochlor_nomit_even9870_humans.biom -o beta_10perpop_humans -t qs850_qs10052_qs1448_qs11212_qs10317_qs11358_nobloom_nodoubletons_min1k_placement.tog.tre -m human_NHP_mapping.txt 
+
+#PERMANOVA (in R v3.5.1)
+#subset mapping file to humans only
+
+library(vegan)
+library (qiimer)
+
+uw_dm_human<-read_qiime_distmat('beta_10perpop_humans/unweighted_unifrac_dm.txt')
+human_map<-human_mapping.txt
+adonis(uw_dm~life_style, data=human_map, permutations=5000)
+
+w_dm_human<-read_qiime_distmat('beta_10perpop_humans/weighted_unifrac_dm.txt')
+adonis(w_dm~life_style, data=human_map, permutations=5000)
+
+#beta dispersion (in Rv3.5.1)
+
+human_beta<-betadisper(w_human_dm, human_map$life_style)
+human_beta
+
+#alpha diversity ANOVA (in Rv3.5.1)
+#subset alpha diversity to humans only, in .csv with metadata columns
+
+alpha_human<-read.csv('alpha_human.csv')
+summary(aov(alpha_human16$PD_whole_tree~alpha_human16$life_style))
+summary(aov(alpha_human16$chao1~alpha_human16$life_style))
+summary(aov(alpha_human16$observed_otus~alpha_human16$life_style))
+
+#LEfSe
+
+biom convert -i table_min1k_filtered_nochlor_nomit_even9870_humans.biom -o table_min1k_filtered_nochlor_nomit_even9870_humans.txt --to-tsv --header-key taxonomy
+
+#format this .txt file for LefSe (include metadata in header row) and run on Galaxy server with default options
+
+#filter to only nonindustrialized humans, cercopithecines, and apes
+
+filter_samples_from_otu_table.py -i table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans.biom -o table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans_nourban.biom -m human_NHP_mapping.txt -s 'life_style:*,!urban'
+
+
+#ordination plot and distance matrices
+
+beta_diversity_through_plots.py -i table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans_nourban.biom -o beta_10perpop_OWMapeshumans_nourban -t qs850_qs10052_qs1448_qs11212_qs10317_qs11358_nobloom_nodoubletons_min1k_placement.tog.tre -m human_NHP_mapping.txt 
+
+#jackknife for UPGMA tree
+
+jackknifed_beta_diversity.py -i table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans_nourban.biom -o jackknife_OWMapehumans_nourban -e 9870 -m human_NHP_mapping.txt -t qs850_qs10052_qs1448_qs11212_qs10317_qs11358_nobloom_nodoubletons_min1k_placement.tog.tre -p /Users/Kramato/Desktop/param.txt
+
+#parameters are
+#multiple_rarefactions_even_depth:num_reps 1000
+
+# distance matrices for humans and cercopithecines, humans and apes
+
+filter_distance_matrix.py -i beta_10perpop_OWMapeshumans_nourban/unweighted_unifrac_dm.txt -o beta_10perpop_OWMapeshumans_nourban/unweighted_unifrac_dm_noapes.txt -m human_NHP_mapping.txt -s 'phyl_group:*!Ape'
+
+filter_distance_matrix.py -i beta_10perpop_OWMapeshumans_nourban/weighted_unifrac_dm.txt -o beta_10perpop_OWMapeshumans_nourban/weighted_unifrac_dm_noapes.txt -m human_NHP_mapping.txt -s 'phyl_group:*!Ape'
+
+filter_distance_matrix.py -i beta_10perpop_OWMapeshumans_nourban/unweighted_unifrac_dm.txt -o beta_10perpop_OWMapeshumans_nourban/unweighted_unifrac_dm_nocercs.txt -m human_NHP_mapping.txt -s 'phyl_group:*!OWM'
+
+filter_distance_matrix.py -i beta_10perpop_OWMapeshumans_nourban/weighted_unifrac_dm.txt -o beta_10perpop_OWMapeshumans_nourban/weighted_unifrac_dm_nocercs.txt -m human_NHP_mapping.txt -s 'phyl_group:*!OWM'
+
+#PERMANOVAs (in R) and envfit and distance_test.py
+#reduce mapping file to relevant samples only
+
+uw_dm_nocerc<-read_qiime_distmat('beta_10perpop_humans/unweighted_unifrac_dm_nocercs.txt')
+map_nocerc<-nocerc_mapping.txt
+adonis(uw_dm_nocerc~phyl_group, data=map_nocerc, permutations=5000)
+
+w_dm_nocerc<-read_qiime_distmat('beta_10perpop_humans/weighted_unifrac_dm_nocercs.txt')
+adonis(w_dm_nocerc~phyl_group, data=map_nocerc, permutations=5000)
+
+uw_dm_noape<-read_qiime_distmat('beta_10perpop_humans/unweighted_unifrac_dm_noapes.txt')
+map_noape<-noape_mapping.txt
+adonis(uw_dm_noape~phyl_group, data=map_noape, permutations=5000)
+
+w_dm_noape<-read_qiime_distmat('beta_10perpop_humans/weighted_unifrac_dm_noapes.txt')
+adonis(w_dm_noape~phyl_group, data=map_noape, permutations=5000)
+
+#beta dispersion (in Rv3.5.1)
+
+ape_beta<-betadisper(w_dm_nocerc, map_nocerc$phyl_group)
+ape_beta
+
+cerc_beta<-betadisper(w_dm_noape, map_noape$phyl_group)
+cerc_beta
+
+#envfit (in Rv3.5.1)
+
+uw_dm_nocerc_nmds<-metaMDS(uw_dm_nocerc, trymax100)
+envfit_uw_nocerc<-envfit(uw_dm_nocerc_nmds~phyl_group2+ecological_group, data=map_nocerc, permu=5000)
+envfit_uw_nocerc
+
+w_dm_nocerc_nmds<-metaMDS(w_dm_nocerc, trymax100)
+envfit_w_nocerc<-envfit(w_dm_nocerc_nmds~phyl_group2+ecological_group, data=map_nocerc, permu=5000)
+envfit_w_nocerc
+
+uw_dm_noape_nmds<-metaMDS(uw_dm_noape, trymax100)
+envfit_uw_noape<-envfit(uw_dm_noape_nmds~phyl_group2+ecol_group, data=map_noape, permu=5000)
+envfit_uw_noape
+
+w_dm_noape_nmds<-metaMDS(w_dm_noape, trymax100)
+envfit_w_noape<-envfit(w_dm_noape_nmds~phyl_group2+ecol_group, data=map_noape, permu=5000)
+envfit_w_noape
+
+#t-test of distances
+
+make_distance_boxplots.py -d weighted_unifrac_dm.txt -o distances -m human_NHP_mapping.txt -f 'phyl_group' --save_raw_data
+
+#alpha diversity ANOVA
+#subset alpha diversity to relevant data, in .csv with metadata columns
+
+alpha_nocercs<-read.csv('alpha_nocercs.csv')
+summary(aov(alpha_nocercs$PD_whole_tree~alpha_nocercs$phyl_group))
+summary(aov(alpha_nocercs$chao1~alpha_nocercs$phyl_group))
+summary(aov(alpha_nocercs$observed_otus~alpha_nocercs$phyl_group))
+
+alpha_noapes<-read.csv('alpha_noapes.csv')
+summary(aov(alpha_noapes$PD_whole_tree~alpha_noapes$phyl_group))
+summary(aov(alpha_noapes$chao1~alpha_noapes$phyl_group))
+summary(aov(alpha_noapes$observed_otus~alpha_noapes$phyl_group))
+
+#core microbiome
+
+filter_samples_from_OTU_table.py -i table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans_nourban.biom -o table_min1k_filtered_nochlor_nomit_even9870_OWMhumans_nourban.biom -m human_NHP_mapping.txt -s 'phyl_group:*!Ape'
+
+compute_core_microbiome.py -i table_min1k_filtered_nochlor_nomit_even9870_OWMhumans_nourban.biom -o human_OWM_core --min_fraction_for_core 0.7 --num_fraction_for_core_steps 7
+
+filter_samples_from_OTU_table.py -i table_min1k_filtered_nochlor_nomit_even9870_OWMapeshumans_nourban.biom -o table_min1k_filtered_nochlor_nomit_even9870_apeshumans_nourban.biom -m human_NHP_mapping.txt -s 'phyl_group:*!OWM'
+
+compute_core_microbiome.py -i table_min1k_filtered_nochlor_nomit_even9870_apeshumans_nourban.biom -o human_ape_core --min_fraction_for_core 0.7 --num_fraction_for_core_steps 7
+
+#LefSe
+
+biom convert -i table_min1k_filtered_nochlor_nomit_even9870_humansOWM.biom -o table_min1k_filtered_nochlor_nomit_even9870_OWMhumans.txt --to-tsv --header-key taxonomy
+
+biom convert -i table_min1k_filtered_nochlor_nomit_even9870_humansapes.biom -o table_min1k_filtered_nochlor_nomit_even9870_humansapes.txt --to-tsv --header-key taxonomy
+
+#format these .txt files for LefSe (include metadata in header row) and run on Galaxy server with default options
+
+#repeat all analyses from #PERMANOVAs through #LefSe without removing industrialized humans
+
+#repeat all analyses from #PERMANOVAs through #LefSe humans and baboons only (only include genus Papio)
+
+#repeat all analyses from #PERMANOVAs through #LefSe for humans compared to cercopithecines+apes (coded as human vs primate)

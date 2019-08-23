@@ -1,0 +1,294 @@
+#KneadData v0.6.1 used to trim sequences, quality-filter data, and remove host reads.
+
+kneaddata --input file.fastq --reference-db /hg19/Homo_sapiens_Bowtie2_v0.1/Homo_sapiens --output /kneaddata_output
+
+
+#Metaphlan2 was used for taxonomic profiling. KneadData output files were used as input.
+
+metaphlan2.py --input_type fastq --nproc 4 file_kneaddata.fastq file_profile.txt
+
+merge_metaphlan_tables.py *_profile.txt > all_samples_merged.txt
+
+grep -E "(s__)|(^ID)" all_samples_merged.txt | grep -v "t__" | sed 's/^.*s__//g' > all_samples_merged_species.txt
+
+
+#QIIME v1.9.1 was used for downstream analyses 
+
+biom convert -i all_samples_merged_species.txt -o all_samples_merged_species.biom --table-type="OTU table" --to-hdf5
+
+beta_diversity_through_plots.py -i all_samples_merged_species.biom -m shotgun_metadata.txt -o /all_samples_metaphlan -p betadiv_params.txt
+
+#The following parameters were used for the beta_diversity_through_plots script:
+beta_diversity:metrics bray_curtis
+make_emperor:ignore_missing_samples True
+
+#filter to humans, apes, and cercopithecines only
+filter_distance_matrix.py -i all_samples_metaphlan/bray_curtis_dm.txt -o  bray_curtis_dm_OWMapeshumans.txt -m shotgun_metadata.txt -s 'HCA:keep'
+
+#filter to humans and apes, humans and cercopithecines
+filter_distance_matrix.py -i bray_curtis_dm_OWMapeshumans.txt -o  bray_curtis_dm_OWMhumans.txt -m shotgun_metadata.txt -s 'phyl_group:*!OWM'
+
+filter_distance_matrix.py -i bray_curtis_dm_OWMapeshumans.txt -o  bray_curtis_dm_apeshumans.txt -m shotgun_metadata.txt -s 'phyl_group:*!Ape'
+
+
+#PERMANOVAs (with R v3.5.1)
+#Use QIIME beta_diversity_through_plots output as an input file
+
+library(tidyverse)
+library(vegan)
+
+meta_bray_OWM = read.table("bray_curtis_dm_OWMhumans.txt", sep = "\t", header = T) %>% 
+  column_to_rownames() %>% as.dist()
+
+metadata = read.csv("shotgun_metadata.csv", header = T)
+
+adonis(meta_bray_OWM ~ phyl_group, data = metadata, permutations = 5000)
+
+meta_bray_ape = read.table("bray_curtis_dm_apeshumans.txt", sep = "\t", header = T) %>% 
+  column_to_rownames() %>% as.dist()
+
+metadata = read.csv("shotgun_metadata.csv", header = T)
+
+adonis(meta_bray_ape ~ phyl_group, data = metadata, permutations = 5000)
+
+
+#Run HUMAnN2 v0.11.1 to create functional profiles of each metagenome. Combine all tables, renormalize, and split the stratified tables.
+
+humann2 --input /kneaddata_output/file_kneaddata.fastq --output /humann2_output --nucleotide-database /chocophlan/chocophlan --protein-database /uniref50/uniref 
+
+humann2_join_tables --input /humann2_output --output /humann2_joined --file_name pathabundance
+
+humann2_renorm_table --input /humann2_joined/humann2_output_pathabundance.tsv --output /humann2_joined/humann2_output_pathabundance_relab.tsv --units relab
+
+humann2_split_stratified_table --input /humann2_joined/humann2_output_pathabundance_relab.tsv --output /humann2_joined/pathabundance_relab
+
+humann2_join_tables --input /humann2_output --output /humann2_joined --file_name genefamilies
+
+humann2_regroup_table --input /humann2_joined/humann2_output_genefamilies.tsv --custom /utility_mapping/map_ko_uniref50.txt.gz  --output /humann2_joined/humann2_output_genefamilies_ko.tsv
+
+humann2_renorm_table --input /humann2_joined/humann2_output_genefamilies_ko.tsv --output /humann2_joined/human2_output_genefamilies_ko_cpm.tsv --units cpm
+
+humann2_split_stratified_table --input /humann2_joined/humann2_output_genefamilies_ko_cpm.tsv --output /humann2_joined/genefamilies_cpm
+
+
+#QIIME v1.9.1 was used for downstream analyses
+#make ordination plot
+
+biom convert -i pathabundance_relab_stratified.txt -o pathabundance_relab_stratified.biom --table-type "Pathway table" --to-hdf5
+
+beta_diversity_through_plots.py -i pathabundance_relab_stratified.biom -m shotgun_metadata.txt -o pathabundance_strat -p betadiv_params.txt
+
+#The following parameters were used for the beta_diversity_through_plots script:
+beta_diversity:metrics bray_curtis
+make_emperor:ignore_missing_samples True
+
+#filter to humans, cercopithecines, apes only (make sure filter3 eliminates colobines)
+
+filter_samples_from_otu_table.py -i pathabundance_relab_stratified.biom -o pathabundance_relab_stratified_OWMapeshumans.biom -m shotgun_metadata.txt -s 'HCA:keep'
+
+#ordination plot
+
+beta_diversity_through_plots.py -i pathabundance_relab_stratified_OWMapeshumans.biom -o beta_OWMapeshumans -m shotgun_metadata.txt 
+
+
+#A jackknifed UPGMA tree was created using non-normalized output from HUMAnN2. First, in HUMAnN2, the joined non-normalized output table was stratified.
+
+humann2_split_stratified_table --input humann2_output_pathabundance.tsv --output /jackknifed_tree
+
+#Followed by conversion to a .biom file in QIIME and tree construction.
+
+biom convert -i /jackknifed_tree/humann2_output_pathabundance_stratified.tsv -o /jackknifed_tree/humann2_output_pathabundance_stratified.biom --table-type "Pathway table" --to-hdf5
+
+filter_samples_from_otu_table.py -i humann2_output_pathabundance_stratified.biom -o humann2_output_pathabundance_stratified_OWMapeshumans.biom -m shotgun_metadata.txt -s 'HCA:keep'
+
+jackknifed_beta_diversity.py -i /jackknifed_tree/humann2_output_pathabundance_stratified_OWMapeshumans.biom -o /jackknifed_tree/results_consensus_1000 -e 22000 -m shotgun_metadata.txt -p qiimeparams.txt
+
+#The following parameters were used for the jackknifed_beta_diversity.py script
+make_emperor:ignore_missing_samples True
+beta_diversity:metrics bray_curtis
+multiple_rarefactions_even_depth:num_reps 1000
+
+#filter to humans only
+
+filter_samples_from_otu_table.py -i humann2_output_pathabundance_stratified_OWMapeshumans.biom -o humann2_output_pathabundance_stratified_humans.biom -m shotgun_metadata.txt -s 'Phyl_group:Human'
+
+#ordination plot and distance matrix
+
+beta_diversity_through_plots.py -i humann2_output_pathabundance_stratified_humans.biom -o beta_humans -m shotgun_metadata.txt 
+
+#PERMANOVA (in R v3.5.1)
+#subset mapping file to humans only
+
+library(vegan)
+library (qiimer)
+
+dm_human<-read_qiime_distmat('beta_humans/bray_curtis_dm.txt')
+human_map<-shotgun_human_mapping.txt
+adonis(dm_human~life_style, data=human_map, permutations=5000)
+
+#beta dispersion (in Rv3.5.1)
+
+human_beta<-betadisper(dm_human, human_map$life_style)
+human_beta
+
+
+#LEfSe was used to run an LDA-type analysis on HUMAnN2 pathway abundance
+
+biom convert -i humann2_output_pathabundance_stratified_humans.biom -o humann2_output_pathabundance_stratified_humans.txt --to-tsv --header-key taxonomy
+
+#format this .txt file for LefSe (include metadata in header row)
+
+docker run -it -v /Users:/Users biobakery/lefse bash
+
+format_input.py humann2_output_pathabundance_stratified_humans_withmeta.txt pathabundance_relab_stratified_with_metadata.lefse -c 2 -u 1 -o 1000000
+
+humann2_output_pathabundance_stratified_humans_withmeta.lefse humann2_output_pathabundance_stratified_humans_withmeta.res
+
+plot_res.py --dpi 300 humann2_output_pathabundance_stratified_humans_withmeta.res humann2_output_pathabundance_stratified_humans_withmeta.png --subclades -1 --max_feature_len 150 --right_space 0.25 --left_space 0.25 --width 12
+
+#filter to only nonindustrialized humans, cercopithecines, and apes
+
+filter_samples_from_otu_table.py -i humann2_output_pathabundance_stratified_OWMapeshumans.biom -o humann2_output_pathabundance_stratified_OWMapeshumans_nourban.biom -m shotgun_metadata.txt -s 'life_style:*,!urban'
+
+
+#ordination plot and distance matrices
+
+beta_diversity_through_plots.py -i humann2_output_pathabundance_stratified_OWMapeshumans_nourban.biom -o beta_OWMapeshumans_nourban -m shotgun_metadata.txt 
+
+#jackknife for UPGMA tree
+
+filter_samples_from_otu_table.py -i humann2_output_pathabundance_stratified_OWMapeshumans.biom -o humann2_output_pathabundance_stratified_OWMapeshumans_nourban.biom -m shotgun_metadata.txt -s 'life_style:*,!urban'
+
+jackknifed_beta_diversity.py -i /jackknifed_tree/humann2_output_pathabundance_stratified_OWMapeshumans_nourban.biom -o /jackknifed_tree/results_consensus_1000 -e 22000 -m shotgun_metadata.txt -p qiimeparams.txt
+
+#The following parameters were used for the jackknifed_beta_diversity.py script
+make_emperor:ignore_missing_samples True
+beta_diversity:metrics bray_curtis
+multiple_rarefactions_even_depth:num_reps 1000
+
+# distance matrices for humans and cercopithecines, humans and apes
+
+filter_distance_matrix.py -i beta_OWMapeshumans_nourban/bray_curtis_dm.txt -o beta_OWMapeshumans_nourban/bray_curtis_dm_noapes.txt -m shotgun_metadata.txt -s 'phyl_group:*!Ape'
+
+filter_distance_matrix.py -i beta_OWMapeshumans_nourban/bray_curtis_dm.txt -o beta_OWMapeshumans_nourban/bray_curtis_dm_nocercs.txt -m shotgun_metada.txt -s 'phyl_group:*!OWM'
+
+
+#PERMANOVAs (in R) and envfit and distance_test.py
+#reduce mapping file to relevant samples only
+
+dm_nocerc<-read_qiime_distmat('beta_OWMapeshumans_nourban/bray_curtis_dm_nocercs.txt')
+map_nocerc<-nocerc_mapping.txt
+adonis(dm_nocerc~phyl_group, data=map_nocerc, permutations=5000)
+
+dm_noape<-read_qiime_distmat('beta_OWMapeshumans_nourban/bray_curtis_dm_noapes.txt')
+map_noape<-noape_mapping.txt
+adonis(dm_noape~phyl_group, data=map_noape, permutations=5000)
+
+#beta dispersion (in Rv3.5.1)
+
+ape_beta<-betadisper(dm_nocerc, map_nocerc$phyl_group)
+ape_beta
+
+cerc_beta<-betadisper(dm_noape, map_noape$phyl_group)
+cerc_beta
+
+#envfit (in Rv3.5.1)
+
+dm_nocerc_nmds<-metaMDS(dm_nocerc, trymax100)
+envfit_nocerc<-envfit(dm_nocerc_nmds~phyl_group2+ecol_group, data=map_nocerc, permu=5000)
+envfit_nocerc
+
+dm_noape_nmds<-metaMDS(dm_noape, trymax100)
+envfit_noape<-envfit(dm_noape_nmds~phyl_group2+ecol_group, data=map_noape, permu=5000)
+envfit_noape
+
+#t-test of distances
+
+make_distance_boxplots.py -d bray_curtis_dm.txt -o distances -m shotgun_metadata.txt -f 'phyl_group' --save_raw_data
+
+#core microbiome
+#may have to convert to .txt first and copy the first column to the last and name 'taxonomy'
+
+filter_samples_from_OTU_table.py -i humann2_output_pathabundance_stratified_OWMapeshumans_nourban.biom -o humann2_output_pathabundance_stratified_OWMhumans_nourban.biom -m shotgun_metadata.txt -s 'phyl_group:*!Ape'
+
+compute_core_microbiome.py -i humann2_output_pathabundance_stratified_OWMhumans_nourban.biom -o human_OWM_core --min_fraction_for_core 0.7 --num_fraction_for_core_steps 7
+
+filter_samples_from_OTU_table.py -i humann2_output_pathabundance_stratified_OWMapeshumans_nourban.biom -o humann2_output_pathabundance_stratified_apeshumans_nourban.biom -m shotgun_metadata.txt -s 'Ppyl_group:*!OWM'
+
+compute_core_microbiome.py -i humann2_output_pathabundance_stratified_apeshumans_nourban.biom -o human_ape_core --min_fraction_for_core 0.7 --num_fraction_for_core_steps 7
+
+#LefSe
+
+biom convert -i humann2_output_pathabundance_stratified_OWMhumans_nourban.biom -o humann2_output_pathabundance_stratified_OWMhumans_nourban.txt  --to-tsv --header-key taxonomy
+
+biom convert -i humann2_output_pathabundance_stratified_apeshumans_nourban.biom -o humann2_output_pathabundance_stratified_apeshumans_nourban.txt --to-tsv --header-key taxonomy
+
+#format these .txt files for LefSe (include metadata in header row) and run on Galaxy server with default options
+
+#repeat all analyses from #PERMANOVAs through #LefSe without removing industrialized humans (don't rewrite code)
+
+#repeat all analyses from #PERMANOVAs through #LefSe humans and baboons only (only include genus Papio)
+
+#repeat all analyses from #PERMANOVAs through #LefSe for humans compared to cercopithecines+apes (coded as human vs primate)
+
+
+
+#For the CAZyme analysis, the KneadData output was used as input. Files were first converted from .fastq to .fasta using FASTX-Toolkit.
+
+fastq_to_fasta -i /kneaddata_output/file_kneaddata.fastq -o /q2a_output/file_kneaddata.fasta
+
+#Colons were removed from the column headers and nucleotide sequences were translated to protein sequences using Transeq.
+
+sed -ie 's/:/./g' /q2a_output/file_kneaddata.fasta
+
+transeq /q2a_output/file_kneaddata.fasta file.pep -frame=6 -clean
+
+#HMMER v3.2.1 was used to align translated protein sequences to the dbCAN database.
+
+hmmscan --cpu 10 --domtblout /peptide_sequences/file.out.cm -o /peptide_sequences/file.out dbCAN-fam-HMMs.txt /peptide_sequences/file.pep
+
+#Alignment results were parsed with the hmmscan_parser3.py script.
+
+#Create a dataframe with count of each cazyme family hit for each sample.
+#Starting files - individual files for every sample with list of each sequence hit and what cazyme family it hit (these have been filtered for e-value < 1.0e-3 and coverage > 0.3)
+
+#Format data (in R v3.5.1)
+library(tidyverse)
+library(data.table)
+
+#Get counts of each cazyme in each file ----
+
+#Function to append filename to each record
+
+read_plus = function(flnm) {
+  fread(flnm) %>%
+    mutate(filename = flnm)
+}
+
+#Import all files and merge
+
+filtered = list.files(pattern = "*.out.dm.filtered.txt", full.names = T) %>%
+  map_df(~read_plus(.))
+
+#Output for posterity
+write_csv(filtered,"filtered2.csv")
+
+#Group by filenames and then by cazyme family
+
+grouped = filtered %>% group_by(`#HMM_family`) %>% count(filename)
+
+#Manipulate dataframe so it's set up like an OTU table
+
+count_table = grouped %>% spread(`#HMM_family`, n)
+
+#Output for posterity
+
+write_csv(count_table,"count_table2.csv")
+
+
+#Repeat all downstream analysis as outlined for HUMANn2 data using CAZyme abundance table
+
+
+
+
+
